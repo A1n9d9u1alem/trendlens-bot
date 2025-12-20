@@ -1,0 +1,58 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+    
+    - name: Install Python dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install pytest flake8
+    
+    - name: Install Node dependencies
+      run: npm install
+    
+    - name: Lint Python code
+      run: flake8 bot.py database.py --max-line-length=120 --ignore=E501,W503
+      continue-on-error: true
+    
+    - name: Check Python syntax
+      run: python -m py_compile bot.py database.py payment_handler.py
+    
+    - name: Check Node syntax
+      run: node -c aggregator.js
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to Railway
+      env:
+        RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      run: |
+        npm install -g @railway/cli
+        railway up --service bot
+        railway up --service aggregator
