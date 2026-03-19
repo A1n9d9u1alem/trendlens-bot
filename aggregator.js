@@ -12,12 +12,34 @@ class ContentAggregator {
             socket: { tls: true, rejectUnauthorized: false }
         });
         this.categories = {
-            'memes': { subreddits: ['memes', 'dankmemes', 'funny'], keywords: ['meme', 'funny'] },
-            'sports': { subreddits: ['sports', 'soccer', 'nba', 'nfl', 'cricket'], keywords: ['football', 'basketball', 'sports'] },
-            'tech': { subreddits: ['technology', 'programming', 'gadgets'], keywords: ['tech', 'software', 'AI'] },
-            'gaming': { subreddits: ['gaming', 'pcgaming', 'nintendo'], keywords: ['game', 'gaming', 'esports'] },
-            'entertainment': { subreddits: ['movies', 'music', 'television'], keywords: ['movie', 'music', 'celebrity'] },
-            'news': { subreddits: ['news', 'worldnews'], keywords: ['news', 'breaking'] }
+            'memes': { 
+                subreddits: ['memes', 'dankmemes', 'funny', 'comedyheaven'], 
+                keywords: ['meme', 'funny', 'humor', 'joke', 'lol', 'comedy']
+            },
+            'sports': { 
+                subreddits: ['sports', 'soccer','PremierLeague', 'LaLiga', 'Bundesliga', 'seriea', 'championsleague', 'football', 'Boxing', 'tennis', 'MMA', 'ufc', 'nba', 'nfl', 'cricket', ], 
+                keywords: ['football', 'basketball', 'sports', 'boxing', 'fight', 'game', 'match', 'player', 'team', 'premier league', 'la liga', 'bundesliga', 'serie a', 'champions league', 'uefa', 'fifa', 'world cup', 'messi', 'ronaldo', 'goal', 'transfer', 'mma', 'ufc', 'knockout', 'fighter']
+            },
+            'entertainment': { 
+                subreddits: ['music', 'movies', 'television', 'dance'], 
+                keywords: ['music', 'dance', 'movie', 'celebrity', 'artist', 'singer']
+            },
+            'gaming': { 
+                subreddits: ['gaming', 'pcgaming', 'nintendo', 'xbox', 'playstation'], 
+                keywords: ['game', 'gaming', 'esports', 'steam', 'twitch']
+            },
+            'tech': { 
+                subreddits: ['technology', 'programming', 'gadgets', 'apple'], 
+                keywords: ['tech', 'software', 'AI', 'programming', 'gadget']
+            },
+            'jobs': {
+                subreddits: ['forhire', 'freelance', 'remotework'],
+                keywords: ['freelance', 'remote', 'upwork', 'fiverr', 'contract', 'gig', 'work from home', 'freelancer']
+            },
+            'news': { 
+                subreddits: ['news', 'worldnews', 'politics'], 
+                keywords: ['news', 'breaking', 'politics', 'world']
+            }
         };
     }
 
@@ -257,7 +279,40 @@ class ContentAggregator {
 
     async fetchNews(category) {
         try {
-            const response = await axios.get('https://newsapi.org/v2/top-headlines', {
+            // Fetch from specific news sources
+            const sources = ['bbc-news', 'cnn', 'al-jazeera-english', 'reuters', 'the-guardian-uk', 'associated-press', 'bloomberg', 'the-washington-post', 'the-new-york-times'];
+            
+            for (const source of sources) {
+                try {
+                    const response = await axios.get('https://newsapi.org/v2/top-headlines', {
+                        params: {
+                            sources: source,
+                            pageSize: 5,
+                            apiKey: process.env.NEWS_API_KEY
+                        }
+                    });
+
+                    for (const article of response.data.articles || []) {
+                        const trendScore = this.calculateTrendScore(1000, 100, new Date(article.publishedAt).getTime() / 1000);
+
+                        await this.storeContent({
+                            platform: 'news',
+                            category: 'news',
+                            title: article.title,
+                            url: article.url,
+                            thumbnail: article.urlToImage,
+                            description: `${source.toUpperCase()} | ${article.description || ''}`,
+                            engagement_score: 1000,
+                            trend_score: trendScore
+                        });
+                    }
+                } catch (err) {
+                    console.error(`Failed to fetch from ${source}:`, err.message);
+                }
+            }
+            
+            // Also fetch general top headlines
+            const generalResponse = await axios.get('https://newsapi.org/v2/top-headlines', {
                 params: {
                     country: 'us',
                     category: category === 'tech' ? 'technology' : 'general',
@@ -266,7 +321,7 @@ class ContentAggregator {
                 }
             });
 
-            for (const article of response.data.articles) {
+            for (const article of generalResponse.data.articles || []) {
                 const trendScore = this.calculateTrendScore(1000, 100, new Date(article.publishedAt).getTime() / 1000);
 
                 await this.storeContent({
@@ -286,26 +341,62 @@ class ContentAggregator {
     }
 
     calculateTrendScore(engagement, secondary, timestamp) {
-        const now = Date.now() / 1000;
-        const age = now - timestamp;
-        const freshness = Math.max(0, 1 - (age / 86400)); // 24 hours decay
-        return (Math.log(engagement + 1) * 0.7 + Math.log(secondary + 1) * 0.3) * freshness;
+        try {
+            // Validate inputs
+            const eng = parseFloat(engagement) || 0;
+            const sec = parseFloat(secondary) || 0;
+            const ts = parseFloat(timestamp) || (Date.now() / 1000);
+            
+            // Ensure positive values
+            if (eng < 0 || sec < 0 || ts < 0) return 0;
+            
+            const now = Date.now() / 1000;
+            const age = Math.max(0, now - ts);
+            const freshness = Math.max(0, 1 - (age / 86400)); // 24 hours decay
+            
+            const score = (Math.log(eng + 1) * 0.7 + Math.log(sec + 1) * 0.3) * freshness;
+            
+            // Return 0 if NaN or invalid
+            return isNaN(score) || !isFinite(score) ? 0 : Math.max(0, score);
+        } catch (error) {
+            console.error('Trend score calculation error:', error.message);
+            return 0;
+        }
     }
 
     async storeContent(content) {
         try {
+            const crypto = require('crypto');
+            
+            // Generate content hash for deduplication
+            const normalizedTitle = content.title.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+            const contentHash = crypto.createHash('sha256')
+                .update(normalizedTitle + content.category)
+                .digest('hex');
+            
+            // Check for duplicate by hash
+            const duplicateCheck = await this.db.query(
+                'SELECT id FROM content WHERE content_hash = $1 AND category = $2 LIMIT 1',
+                [contentHash, content.category]
+            );
+            
+            if (duplicateCheck.rows.length > 0) {
+                // Duplicate found, skip
+                return;
+            }
+            
             const query = `
-                INSERT INTO content (platform, category, title, url, thumbnail, description, engagement_score, trend_score, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                INSERT INTO content (platform, category, title, url, thumbnail, description, engagement_score, trend_score, content_hash, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
                 ON CONFLICT (url) DO UPDATE SET
-                engagement_score = EXCLUDED.engagement_score,
-                trend_score = EXCLUDED.trend_score,
-                created_at = NOW()
+                    engagement_score = EXCLUDED.engagement_score,
+                    trend_score = EXCLUDED.trend_score
             `;
             
             await this.db.query(query, [
                 content.platform, content.category, content.title, content.url,
-                content.thumbnail, content.description, content.engagement_score, content.trend_score
+                content.thumbnail, content.description, content.engagement_score, 
+                content.trend_score, contentHash
             ]);
 
             // Cache trending content
@@ -320,7 +411,44 @@ class ContentAggregator {
                 }
             }
         } catch (error) {
-            console.error('Store content error:', error.message);
+            if (!error.message.includes('duplicate key')) {
+                console.error('Store content error:', error.message);
+            }
+        }
+    }
+
+    async fetchFreelanceJobs() {
+        try {
+            // Fetch job-related content from Twitter mentioning Upwork/Fiverr
+            const platforms = ['upwork', 'fiverr'];
+            for (const platform of platforms) {
+                const response = await axios.get('https://api.twitter.com/2/tweets/search/recent', {
+                    headers: { 'Authorization': `Bearer ${process.env.TWITTER_BEARER_TOKEN}` },
+                    params: {
+                        query: `${platform} (hiring OR job OR freelance) -is:retweet`,
+                        'tweet.fields': 'public_metrics,created_at',
+                        max_results: 10
+                    }
+                });
+
+                if (response.data.data) {
+                    for (const tweet of response.data.data) {
+                        const metrics = tweet.public_metrics;
+                        await this.storeContent({
+                            platform: platform,
+                            category: 'jobs',
+                            title: tweet.text.substring(0, 100),
+                            url: `https://twitter.com/i/status/${tweet.id}`,
+                            thumbnail: null,
+                            description: `${platform.charAt(0).toUpperCase() + platform.slice(1)} opportunity | ${metrics.like_count} likes`,
+                            engagement_score: metrics.like_count + metrics.retweet_count,
+                            trend_score: this.calculateTrendScore(metrics.like_count, metrics.retweet_count, new Date(tweet.created_at).getTime() / 1000)
+                        });
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('Freelance jobs fetch error:', error.message);
         }
     }
 
@@ -340,6 +468,9 @@ class ContentAggregator {
             if (process.env.TWITTER_BEARER_TOKEN) await this.fetchTwitterTrends(category, config.keywords);
             if (process.env.RAPIDAPI_TIKTOK_KEY) await this.fetchTikTokTrends(category, config.keywords);
             if (process.env.INSTAGRAM_ACCESS_TOKEN) await this.fetchInstagramTrends(category, config.keywords);
+            
+            // Fetch freelance jobs from Upwork/Fiverr mentions
+            if (category === 'jobs' && process.env.TWITTER_BEARER_TOKEN) await this.fetchFreelanceJobs();
             
             // Fetch news
             await this.fetchNews(category);
@@ -367,15 +498,15 @@ class ContentAggregator {
     }
 
     startScheduler() {
-        // Hot categories (sports, news) - every 5 minutes
-        cron.schedule('*/5 * * * *', () => {
+        // Hot categories (sports, news) - every 2 minutes for real-time updates
+        cron.schedule('*/2 * * * *', () => {
             console.log('Fetching hot categories...');
             this.aggregateCategory('sports');
             this.aggregateCategory('news');
         });
         
-        // Regular categories - every 30 minutes
-        cron.schedule('*/30 * * * *', () => {
+        // Regular categories - every 10 minutes for faster updates
+        cron.schedule('*/10 * * * *', () => {
             this.aggregateContent();
         });
         
@@ -392,9 +523,10 @@ class ContentAggregator {
         for (const subreddit of config.subreddits) {
             await this.fetchRedditTrends(subreddit, category);
         }
-        // Skip failing APIs
         if (process.env.YOUTUBE_API_KEY) await this.fetchYouTubeTrends(category, config.keywords);
         if (process.env.TWITTER_BEARER_TOKEN) await this.fetchTwitterTrends(category, config.keywords);
+        if (process.env.RAPIDAPI_TIKTOK_KEY) await this.fetchTikTokTrends(category, config.keywords);
+        if (category === 'jobs' && process.env.TWITTER_BEARER_TOKEN) await this.fetchFreelanceJobs();
         if (process.env.NEWS_API_KEY) await this.fetchNews(category);
     }
 }

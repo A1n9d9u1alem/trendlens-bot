@@ -18,6 +18,10 @@ class User(Base):
     is_premium = Column(Boolean, default=False)
     subscription_end = Column(DateTime)
     categories = Column(Text)  # JSON string of subscribed categories
+    language = Column(String(5), default='en')  # User language preference
+    notification_enabled = Column(Boolean, default=True)
+    notification_frequency = Column(String(20), default='hourly')  # hourly, daily, instant
+    notification_categories = Column(Text)  # JSON array of categories to notify
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     
 class Content(Base):
@@ -28,6 +32,7 @@ class Content(Base):
     category = Column(String(50), nullable=False)
     title = Column(Text, nullable=False)
     url = Column(Text, nullable=False, unique=True)
+    content_hash = Column(String(64), index=True)  # SHA256 hash for deduplication
     thumbnail = Column(Text)
     description = Column(Text)
     engagement_score = Column(Float, default=0)
@@ -81,18 +86,19 @@ class ContentModeration(Base):
 # Database setup with optimized connection pooling
 engine = create_engine(
     os.getenv('DATABASE_URL'),
-    pool_size=20,              # Increased from 5
-    max_overflow=40,           # Increased from 10
+    pool_size=10,              # Reduced from 20
+    max_overflow=20,           # Reduced from 40
     pool_pre_ping=True,
-    pool_recycle=1800,         # Recycle every 30 min
-    pool_timeout=30,           # Wait 30s for connection
-    echo=False,                # Disable SQL logging for performance
+    pool_recycle=1800,
+    pool_timeout=30,
+    echo=False,
     connect_args={
         'connect_timeout': 10,
-        'options': '-c statement_timeout=30000'  # 30s query timeout
-    }
+        'options': '-c statement_timeout=30000'
+    },
+    pool_use_lifo=True,        # Use LIFO for better connection reuse
 )
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
 
 def create_tables():
     Base.metadata.create_all(bind=engine)
@@ -103,3 +109,27 @@ def get_db():
         yield db
     finally:
         db.close()
+        
+def get_db_context():
+    """Context manager for database sessions"""
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+class NotificationLog(Base):
+    __tablename__ = 'notification_logs'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    content_id = Column(Integer, ForeignKey('content.id'))
+    status = Column(String(20), default='pending')  # pending, sent, failed
+    sent_at = Column(DateTime)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
