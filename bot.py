@@ -741,11 +741,16 @@ class TrendLensBot:
             self.track_analytics(db, db_user.id, 'category_view', category)
             
             if not contents:
-                await query.edit_message_text(
-                    f"No trending content found for {category}.\n\nTry again later!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="categories")]])
-                )
+                _no_content_text = f"No trending content found for {category}.\n\nTry again later!"
+                _no_content_markup = InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="categories")]])
+                _current_text = getattr(query.message, 'text', None)
+                _current_markup = getattr(query.message, 'reply_markup', None)
+                if _current_text == _no_content_text and _current_markup == _no_content_markup:
+                    await query.answer("Already showing this content.", show_alert=False)
+                else:
+                    await query.edit_message_text(_no_content_text, reply_markup=_no_content_markup)
                 return
+
             
             # Show first item with time filter buttons
             context.user_data['category'] = category
@@ -808,13 +813,23 @@ class TrendLensBot:
         keyboard.append([InlineKeyboardButton("« Categories", callback_data="categories")])
         
         try:
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        except:
-            try:
-                await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-            except:
-                pass
-    
+            new_markup = InlineKeyboardMarkup(keyboard)
+            _current_text = getattr(query.message, 'text', None)
+            _current_markup = getattr(query.message, 'reply_markup', None)
+            if _current_text == text and _current_markup == new_markup:
+                await query.answer("Already showing this content.", show_alert=False)
+            else:
+                await query.edit_message_text(text, reply_markup=new_markup)
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                await query.answer("Already showing this content.", show_alert=False)
+            else:
+                try:
+                    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+                except Exception as inner_e:
+                    if "message is not modified" not in str(inner_e).lower():
+                        raise
+
     async def send_content(self, query, content, index, total, is_premium):
         if isinstance(content, dict):
             title = content['title']
