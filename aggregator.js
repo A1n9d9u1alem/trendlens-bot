@@ -6,7 +6,10 @@ require('dotenv').config();
 
 class ContentAggregator {
     constructor() {
-        this.db = new Client({ connectionString: process.env.DATABASE_URL });
+        this.db = new Client({ 
+            connectionString: process.env.DATABASE_URL,
+            ssl: { rejectUnauthorized: false }
+        });
         this.redis = redis.createClient({ 
             url: process.env.REDIS_URL,
             socket: { tls: true, rejectUnauthorized: false }
