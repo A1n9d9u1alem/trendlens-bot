@@ -1,4 +1,6 @@
 import os
+import signal
+import logging
 import json
 import redis
 import requests
@@ -7,12 +9,13 @@ from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from sqlalchemy.orm import Session
-from database import User, Content, UserInteraction, Payment, Analytics, ContentModeration, get_db, create_tables, SessionLocal
+from database import User, Content, UserInteraction, Payment, Analytics, ContentModeration, get_db, create_tables, SessionLocal, engine
 from payment_handler import PaymentHandler
 from dotenv import load_dotenv
 from ban_decorator import check_ban
 
 load_dotenv()
+
 
 class TrendLensBot:
     def __init__(self):
@@ -66,7 +69,9 @@ class TrendLensBot:
         }
         self.admin_rate_limit = {}  # Track admin command usage
         self.blocked_keywords = ['porn', 'xxx', 'sex', 'nude', 'nsfw', 'gore', 'violence']
+        self.application = None  # Holds the PTB Application instance for shutdown access
     
+
     def calculate_trending_score(self, content):
         """Advanced trending algorithm considering recency, engagement velocity, and quality"""
         from datetime import datetime, timezone
@@ -736,11 +741,16 @@ class TrendLensBot:
             self.track_analytics(db, db_user.id, 'category_view', category)
             
             if not contents:
-                await query.edit_message_text(
-                    f"No trending content found for {category}.\n\nTry again later!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="categories")]])
-                )
+                _no_content_text = f"No trending content found for {category}.\n\nTry again later!"
+                _no_content_markup = InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="categories")]])
+                _current_text = getattr(query.message, 'text', None)
+                _current_markup = getattr(query.message, 'reply_markup', None)
+                if _current_text == _no_content_text and _current_markup == _no_content_markup:
+                    await query.answer("Already showing this content.", show_alert=False)
+                else:
+                    await query.edit_message_text(_no_content_text, reply_markup=_no_content_markup)
                 return
+
             
             # Show first item with time filter buttons
             context.user_data['category'] = category
@@ -803,13 +813,23 @@ class TrendLensBot:
         keyboard.append([InlineKeyboardButton("« Categories", callback_data="categories")])
         
         try:
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        except:
-            try:
-                await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-            except:
-                pass
-    
+            new_markup = InlineKeyboardMarkup(keyboard)
+            _current_text = getattr(query.message, 'text', None)
+            _current_markup = getattr(query.message, 'reply_markup', None)
+            if _current_text == text and _current_markup == new_markup:
+                await query.answer("Already showing this content.", show_alert=False)
+            else:
+                await query.edit_message_text(text, reply_markup=new_markup)
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                await query.answer("Already showing this content.", show_alert=False)
+            else:
+                try:
+                    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+                except Exception as inner_e:
+                    if "message is not modified" not in str(inner_e).lower():
+                        raise
+
     async def send_content(self, query, content, index, total, is_premium):
         if isinstance(content, dict):
             title = content['title']
@@ -2378,29 +2398,128 @@ class TrendLensBot:
         except Exception as e:
             logging.error(f"Error in error_handler: {e}")
     
+    async def post_init(self, application: Application) -> None:
+        """Called by PTB after the application is initialized.
+
+        Stores the application reference so the SIGTERM handler can reach it,
+        and registers a SIGTERM handler that triggers a graceful shutdown.
+        """
+        self.application = application
+        logging.info("Bot initialized — registering SIGTERM handler for graceful shutdown")
+
+        loop = asyncio.get_event_loop()
+
+        def _handle_sigterm():
+            logging.info("SIGTERM received — initiating graceful shutdown")
+            asyncio.ensure_future(self._graceful_shutdown(), loop=loop)
+
+        loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+
+    async def _graceful_shutdown(self) -> None:
+        """Perform an ordered, graceful shutdown of all bot resources.
+
+        Sequence:
+        1. Stop accepting new updates (updater).
+        2. Wait for in-flight handlers to finish (application.stop).
+        3. Release PTB resources (application.shutdown).
+        4. Dispose the SQLAlchemy connection pool.
+        5. Close the Redis connection (if open).
+
+        A brief sleep after step 3 gives Telegram's servers time to register
+        that this polling session has ended, so the next instance can start
+        polling immediately without a 409 Conflict.
+        """
+        logging.info("Graceful shutdown: stopping updater (no new updates)...")
+        try:
+            if self.application and self.application.updater:
+                await self.application.updater.stop()
+        except Exception as e:
+            logging.warning(f"Graceful shutdown: updater stop error: {e}")
+
+        logging.info("Graceful shutdown: stopping application (draining handlers)...")
+        try:
+            if self.application:
+                await self.application.stop()
+        except Exception as e:
+            logging.warning(f"Graceful shutdown: application stop error: {e}")
+
+        logging.info("Graceful shutdown: shutting down application...")
+        try:
+            if self.application:
+                await self.application.shutdown()
+        except Exception as e:
+            logging.warning(f"Graceful shutdown: application shutdown error: {e}")
+
+        # Give Telegram time to fully close the polling session before the
+        # process exits, preventing 409 Conflict on the next startup.
+        logging.info("Graceful shutdown: waiting 2 s for Telegram to release polling session...")
+        await asyncio.sleep(2)
+
+        logging.info("Graceful shutdown: disposing database connection pool...")
+        try:
+            engine.dispose()
+        except Exception as e:
+            logging.warning(f"Graceful shutdown: DB engine dispose error: {e}")
+
+        logging.info("Graceful shutdown: closing Redis connection...")
+        try:
+            if self.redis:
+                self.redis.close()
+        except Exception as e:
+            logging.warning(f"Graceful shutdown: Redis close error: {e}")
+
+        logging.info("Graceful shutdown complete — exiting")
+
+    async def post_shutdown(self, application: Application) -> None:
+        """Called by PTB after the application has fully shut down.
+
+        Used as a final safety net to ensure the database connection pool and
+        Redis are released even when PTB handles the shutdown itself (e.g. on
+        SIGINT during development).
+        """
+        logging.info("Post-shutdown cleanup: disposing database connection pool...")
+        try:
+            engine.dispose()
+        except Exception as e:
+            logging.warning(f"Post-shutdown: DB engine dispose error: {e}")
+
+        logging.info("Post-shutdown cleanup: closing Redis connection...")
+        try:
+            if self.redis:
+                self.redis.close()
+        except Exception as e:
+            logging.warning(f"Post-shutdown: Redis close error: {e}")
+
+        logging.info("Post-shutdown cleanup complete")
+
     def run(self):
-        import logging
         import sys
-        
+
+
         # Fix Windows console encoding for Unicode
         if sys.platform == 'win32':
             import os
             os.system('chcp 65001 >nul 2>&1')
-        
         logging.basicConfig(level=logging.INFO)
-        
+
         # Set up event loop for Python 3.14+ compatibility
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        
-        app = Application.builder().token(self.token).build()
-        
+
+        app = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self.post_init)
+            .post_shutdown(self.post_shutdown)
+            .build()
+        )
+
         # Add error handler
         app.add_error_handler(self.error_handler)
-        
+
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("saved", self.saved))
         app.add_handler(CommandHandler("search", self.search))
@@ -2418,6 +2537,7 @@ class TrendLensBot:
         app.add_handler(CommandHandler("moderate", self.moderation_queue))
         app.add_handler(CommandHandler("approve_content", self.approve_content))
         app.add_handler(CommandHandler("reject_content", self.reject_content))
+
         app.add_handler(CallbackQueryHandler(self.show_categories, pattern="^categories$"))
         app.add_handler(CallbackQueryHandler(self.show_tech_subcategories, pattern="^cat_tech$"))
         app.add_handler(CallbackQueryHandler(self.show_tech_category, pattern="^techcat_"))
@@ -2442,7 +2562,16 @@ class TrendLensBot:
         except UnicodeEncodeError:
             print("TrendLens AI Bot started!")
             print(f"Admin ID: {self.admin_id}")
-        app.run_polling()
+        app.run_polling(
+            # Drop updates that accumulated while the bot was offline so the
+            # new instance doesn't replay stale messages.
+            drop_pending_updates=True,
+            # Let PTB handle SIGINT/SIGTERM; our post_init handler adds a
+            # SIGTERM listener that runs _graceful_shutdown before PTB's own
+            # cleanup, ensuring the polling session is fully closed first.
+            stop_signals=(signal.SIGINT, signal.SIGTERM),
+        )
+
 
 if __name__ == '__main__':
     bot = TrendLensBot()
