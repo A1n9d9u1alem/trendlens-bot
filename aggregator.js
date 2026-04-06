@@ -76,12 +76,25 @@ class ContentAggregator {
                 const engagement = data.score + data.num_comments;
                 const trendScore = this.calculateTrendScore(data.score, data.num_comments, data.created_utc);
                 
+                // Get better thumbnail
+                let thumbnail = null;
+                if (data.preview && data.preview.images && data.preview.images[0]) {
+                    // Use high-res preview image
+                    thumbnail = data.preview.images[0].source.url.replace(/&amp;/g, '&');
+                } else if (data.thumbnail && data.thumbnail.startsWith('http')) {
+                    // Use thumbnail if available
+                    thumbnail = data.thumbnail;
+                } else if (data.url && (data.url.endsWith('.jpg') || data.url.endsWith('.png') || data.url.endsWith('.gif'))) {
+                    // Direct image link
+                    thumbnail = data.url;
+                }
+                
                 await this.storeContent({
                     platform: 'reddit',
                     category,
                     title: data.title,
                     url: `https://reddit.com${data.permalink}`,
-                    thumbnail: data.thumbnail !== 'self' && data.thumbnail !== 'default' ? data.thumbnail : null,
+                    thumbnail: thumbnail,
                     description: data.selftext?.substring(0, 200) || `${data.score} upvotes | ${data.num_comments} comments`,
                     engagement_score: engagement,
                     trend_score: trendScore
