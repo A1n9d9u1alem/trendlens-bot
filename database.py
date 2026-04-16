@@ -1,11 +1,17 @@
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Text, Float, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Text, Float, ForeignKey, event
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy.pool import QueuePool, NullPool
 from datetime import datetime, timezone
 import os
+import logging
 from dotenv import load_dotenv
+from contextlib import contextmanager
+from typing import Generator
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
@@ -84,43 +90,123 @@ class ContentModeration(Base):
     moderated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # Database setup with optimized connection pooling
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+# Connection pool configuration
+POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '20'))  # Number of connections to keep open
+MAX_OVERFLOW = int(os.getenv('DB_MAX_OVERFLOW', '40'))  # Additional connections when pool is full
+POOL_TIMEOUT = int(os.getenv('DB_POOL_TIMEOUT', '30'))  # Seconds to wait for connection
+POOL_RECYCLE = int(os.getenv('DB_POOL_RECYCLE', '3600'))  # Recycle connections after 1 hour
+
+# Create engine with connection pooling
 engine = create_engine(
-    os.getenv('DATABASE_URL'),
-    pool_size=10,              # Reduced from 20
-    max_overflow=20,           # Reduced from 40
-    pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_timeout=30,
-    echo=False,
+    DATABASE_URL,
+    poolclass=QueuePool,           # Use QueuePool for connection pooling
+    pool_size=POOL_SIZE,           # Maintain 20 connections in pool
+    max_overflow=MAX_OVERFLOW,     # Allow 40 additional connections
+    pool_pre_ping=True,            # Verify connections before using
+    pool_recycle=POOL_RECYCLE,     # Recycle connections after 1 hour
+    pool_timeout=POOL_TIMEOUT,     # Wait 30s for available connection
+    pool_use_lifo=True,            # Use LIFO for better connection reuse
+    echo=False,                    # Disable SQL logging (set True for debugging)
     connect_args={
-        'connect_timeout': 10,
-        'options': '-c statement_timeout=30000'
+        'connect_timeout': 10,     # Connection timeout
+        'options': '-c statement_timeout=30000'  # Query timeout (30s)
     },
-    pool_use_lifo=True,        # Use LIFO for better connection reuse
+    execution_options={
+        'isolation_level': 'READ COMMITTED'  # Transaction isolation level
+    }
 )
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
+
+# Session factory
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+    expire_on_commit=False  # Don't expire objects after commit
+)
+
+# Connection pool event listeners for monitoring
+@event.listens_for(engine, "connect")
+def receive_connect(dbapi_conn, connection_record):
+    """Log when new connection is created"""
+    logger.debug("Database connection established")
+
+@event.listens_for(engine, "checkout")
+def receive_checkout(dbapi_conn, connection_record, connection_proxy):
+    """Log when connection is checked out from pool"""
+    logger.debug("Connection checked out from pool")
+
+@event.listens_for(engine, "checkin")
+def receive_checkin(dbapi_conn, connection_record):
+    """Log when connection is returned to pool"""
+    logger.debug("Connection returned to pool")
+
+@event.listens_for(engine, "close")
+def receive_close(dbapi_conn, connection_record):
+    """Log when connection is closed"""
+    logger.debug("Database connection closed")
+
+@event.listens_for(engine, "invalidate")
+def receive_invalidate(dbapi_conn, connection_record, exception):
+    """Log when connection is invalidated"""
+    logger.warning(f"Connection invalidated: {exception}")
 
 def create_tables():
+    """Create all database tables"""
     Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created")
 
-def get_db():
+def get_db() -> Generator[Session, None, None]:
+    """Dependency for getting database session (for FastAPI/async)"""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-        
-def get_db_context():
-    """Context manager for database sessions"""
+
+@contextmanager
+def get_db_context() -> Generator[Session, None, None]:
+    """Context manager for database sessions with automatic commit/rollback"""
     db = SessionLocal()
     try:
         yield db
         db.commit()
-    except Exception:
+    except Exception as e:
         db.rollback()
+        logger.error(f"Database error: {e}")
         raise
     finally:
         db.close()
+
+def get_pool_status() -> dict:
+    """Get current connection pool status"""
+    pool = engine.pool
+    return {
+        'pool_size': pool.size(),
+        'checked_in': pool.checkedin(),
+        'checked_out': pool.checkedout(),
+        'overflow': pool.overflow(),
+        'total_connections': pool.size() + pool.overflow(),
+        'available': pool.checkedin(),
+        'in_use': pool.checkedout()
+    }
+
+def log_pool_status():
+    """Log current pool status for monitoring"""
+    status = get_pool_status()
+    logger.info(
+        f"DB Pool Status - "
+        f"Size: {status['pool_size']}, "
+        f"Available: {status['available']}, "
+        f"In Use: {status['in_use']}, "
+        f"Overflow: {status['overflow']}"
+    )
+
+def dispose_pool():
+    """Dispose all connections in the pool (for shutdown)"""
+    engine.dispose()
+    logger.info("Database connection pool disposed")
 
 
 class NotificationLog(Base):

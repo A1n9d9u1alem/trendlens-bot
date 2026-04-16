@@ -6,13 +6,21 @@ import redis
 import requests
 import asyncio
 from datetime import datetime, timedelta, timezone
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, InlineQueryResultArticle, InputTextMessageContent
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, InlineQueryHandler
 from sqlalchemy.orm import Session
 from database import User, Content, UserInteraction, Payment, Analytics, ContentModeration, get_db, create_tables, SessionLocal, engine
 from payment_handler import PaymentHandler
+from video_handler import VideoHandler
+from image_gallery_handler import ImageGalleryHandler
+from thumbnail_handler import ThumbnailHandler
 from dotenv import load_dotenv
 from ban_decorator import check_ban
+from telegram import InputMediaPhoto
+from error_monitor import error_monitor
+
+from sports_realtime import init_sports_updater, get_sports_updater
+from news_realtime import init_news_updater, get_news_updater
 
 load_dotenv()
 
@@ -22,6 +30,9 @@ class TrendLensBot:
         self.token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.admin_id = int(os.getenv('ADMIN_USER_ID', '0'))
         self.payment_handler = PaymentHandler()
+        self.video_handler = VideoHandler()
+        self.gallery_handler = ImageGalleryHandler()
+        self.thumbnail_handler = ThumbnailHandler()
         try:
             redis_url = os.getenv('REDIS_URL')
             if redis_url:
@@ -67,9 +78,29 @@ class TrendLensBot:
             'news': ['news', 'breaking', 'politics', 'world', 'update', 'report', 'current events'],
             'jobs': ['freelance', 'remote', 'hiring', 'upwork', 'fiverr', 'contract', 'gig', 'work from home', 'freelancer']
         }
+        # Sports quality keywords - prioritize BEST content
+        self.sports_quality_keywords = {
+            'amazing_goals': ['amazing goal', 'incredible goal', 'best goal', 'goal of the year', 'goal of the season', 'stunning goal', 'wonder goal', 'spectacular goal', 'beautiful goal', 'perfect goal', 'worldie', 'banger', 'screamer'],
+            'highlights': ['highlights', 'best moments', 'top plays', 'all goals', 'extended highlights', 'match highlights', 'game highlights'],
+            'skills': ['skills', 'skill', 'dribble', 'nutmeg', 'trick', 'magic', 'insane', 'crazy', 'unbelievable'],
+            'famous_players': ['messi', 'ronaldo', 'neymar', 'mbappe', 'haaland', 'salah', 'benzema', 'lewandowski', 'de bruyne', 'modric', 'vinicius', 'lebron', 'curry', 'durant', 'giannis', 'jokic'],
+            'viral_moments': ['viral', 'trending', 'celebration', 'reaction', 'dramatic', 'last minute', 'winner', 'comeback', 'upset']
+        }
+        
+        # Universal quality keywords for ALL categories
+        self.quality_keywords = {
+            'memes': ['viral meme', 'trending meme', 'best meme', 'hilarious', 'funniest', 'comedy gold', 'meme of the day', 'top meme', 'dank meme', 'quality meme'],
+            'gaming': ['best gameplay', 'epic gameplay', 'insane gameplay', 'game of the year', 'goty', 'world record', 'speedrun', 'pro player', 'highlight', 'best moments', 'top plays', 'new game', 'game reveal', 'trailer', 'esports', 'tournament', 'championship'],
+            'tech': ['breakthrough', 'innovation', 'revolutionary', 'new release', 'just announced', 'unveiled', 'review', 'hands-on', 'first look', 'tutorial', 'guide', 'how to', 'best of', 'top 10', 'comparison', 'game changer', 'cutting edge'],
+            'entertainment': ['viral video', 'trending video', 'official trailer', 'teaser', 'premiere', 'behind the scenes', 'exclusive', 'best performance', 'award winning', 'top song', 'hit song', 'chart topper', 'celebrity interview', 'red carpet'],
+            'news': ['breaking news', 'just in', 'developing', 'exclusive', 'confirmed', 'official', 'major announcement', 'important update', 'live coverage', 'breaking story', 'urgent', 'critical', 'significant'],
+            'jobs': ['hiring now', 'urgent hiring', 'immediate start', 'high paying', 'competitive salary', 'great pay', 'remote work', 'work from home', 'flexible', 'top company', 'fortune 500', 'leading', 'no experience', 'entry level', 'senior', 'lead', 'manager', 'director']
+        }
         self.admin_rate_limit = {}  # Track admin command usage
         self.blocked_keywords = ['porn', 'xxx', 'sex', 'nude', 'nsfw', 'gore', 'violence']
         self.application = None  # Holds the PTB Application instance for shutdown access
+        self.sports_updater = None  # Real-time sports updater
+        self.news_updater = None  # Real-time news updater
     
 
     def calculate_trending_score(self, content):
@@ -214,9 +245,10 @@ class TrendLensBot:
         return [content for _, content in scored_contents]
     
     def deduplicate_content(self, contents, seen_urls=None):
-        """Remove duplicate content using hash and title similarity"""
+        """Remove duplicate content using hash, title similarity, and cross-platform detection"""
         import hashlib
         from difflib import SequenceMatcher
+        import re
         
         if seen_urls is None:
             seen_urls = set()
@@ -224,37 +256,110 @@ class TrendLensBot:
         unique_contents = []
         seen_hashes = set()
         seen_titles = []
+        seen_normalized_urls = set()  # Track normalized URLs across platforms
+        
+        def normalize_url(url):
+            """Normalize URL to detect cross-platform duplicates"""
+            # Remove protocol and www
+            url = re.sub(r'^https?://(www\.)?', '', url.lower())
+            # Remove trailing slashes
+            url = url.rstrip('/')
+            # Remove query parameters for some platforms
+            if any(platform in url for platform in ['youtube.com', 'youtu.be']):
+                # Extract video ID for YouTube
+                video_id_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+                if video_id_match:
+                    return f'youtube:{video_id_match.group(1)}'
+            elif 'reddit.com' in url:
+                # Extract post ID for Reddit
+                post_id_match = re.search(r'/comments/([a-zA-Z0-9]+)', url)
+                if post_id_match:
+                    return f'reddit:{post_id_match.group(1)}'
+            elif 'twitter.com' in url or 'x.com' in url:
+                # Extract tweet ID for Twitter/X
+                tweet_id_match = re.search(r'/status/(\d+)', url)
+                if tweet_id_match:
+                    return f'twitter:{tweet_id_match.group(1)}'
+            return url
+        
+        def extract_core_content(title):
+            """Extract core content from title for better matching"""
+            # Remove common prefixes/suffixes
+            title = re.sub(r'^(BREAKING|WATCH|VIDEO|LIVE|NEW|UPDATE|EXCLUSIVE)[:;\s]+', '', title, flags=re.IGNORECASE)
+            # Remove emojis and special characters
+            title = re.sub(r'[^\w\s]', '', title)
+            # Remove extra whitespace
+            title = ' '.join(title.split())
+            return title.lower().strip()
         
         for content in contents:
             url = content.get('url') if isinstance(content, dict) else content.url
-            title = (content.get('title') if isinstance(content, dict) else content.title).lower().strip()
+            title = (content.get('title') if isinstance(content, dict) else content.title).strip()
+            platform = (content.get('platform') if isinstance(content, dict) else content.platform).lower()
             
-            # Skip if URL already seen
+            # Skip if exact URL already seen
             if url in seen_urls:
                 continue
             
-            # Generate content hash
-            normalized = ''.join(c for c in title if c.isalnum())
+            # Normalize URL for cross-platform detection
+            normalized_url = normalize_url(url)
+            if normalized_url in seen_normalized_urls:
+                continue
+            
+            # Generate content hash from title
+            core_title = extract_core_content(title)
+            normalized = ''.join(c for c in core_title if c.isalnum())
+            
+            if not normalized:  # Skip if title is empty after normalization
+                continue
+            
             content_hash = hashlib.sha256(normalized.encode()).hexdigest()[:16]
             
             # Skip if hash already seen
             if content_hash in seen_hashes:
                 continue
             
-            # Check title similarity (80% threshold)
+            # Check title similarity with fuzzy matching (85% threshold for cross-platform)
             is_duplicate = False
-            for seen_title in seen_titles:
-                similarity = SequenceMatcher(None, title, seen_title).ratio()
-                if similarity > 0.8:
+            for seen_title, seen_platform in seen_titles:
+                # Extract core content for comparison
+                seen_core = extract_core_content(seen_title)
+                similarity = SequenceMatcher(None, core_title, seen_core).ratio()
+                
+                # Higher threshold for same platform, lower for cross-platform
+                threshold = 0.80 if platform == seen_platform else 0.85
+                
+                if similarity > threshold:
                     is_duplicate = True
                     break
             
             if is_duplicate:
                 continue
             
+            # Check for common cross-platform patterns
+            # Example: "Breaking: X announces Y" appears on multiple platforms
+            if len(seen_titles) > 0:
+                # Check if this is a news article shared across platforms
+                words = set(core_title.split())
+                for seen_title, seen_platform in seen_titles:
+                    if platform != seen_platform:  # Only check across platforms
+                        seen_words = set(extract_core_content(seen_title).split())
+                        # If 70% of words match, likely same story
+                        if len(words) > 5 and len(seen_words) > 5:
+                            common_words = words.intersection(seen_words)
+                            word_overlap = len(common_words) / min(len(words), len(seen_words))
+                            if word_overlap > 0.70:
+                                is_duplicate = True
+                                break
+            
+            if is_duplicate:
+                continue
+            
+            # Add to tracking sets
             seen_urls.add(url)
+            seen_normalized_urls.add(normalized_url)
             seen_hashes.add(content_hash)
-            seen_titles.append(title)
+            seen_titles.append((title, platform))
             unique_contents.append(content)
         
         return unique_contents
@@ -530,20 +635,155 @@ class TrendLensBot:
             
             keyboard = [
                 [InlineKeyboardButton("😂 Memes / Comedy", callback_data="cat_memes")],
-                [InlineKeyboardButton("⚽ Sports", callback_data="cat_sports")], 
+                [InlineKeyboardButton("⚽ Sports (Live Updates)", callback_data="sports_leagues")], 
                 [InlineKeyboardButton("🎵 Entertainment", callback_data="cat_entertainment")],
                 [InlineKeyboardButton("🎮 Gaming", callback_data="cat_gaming")],
                 [InlineKeyboardButton("💻 Tech & Gadgets", callback_data="cat_tech")],
                 [InlineKeyboardButton("💼 Jobs & Freelance", callback_data="cat_jobs")],
-                [InlineKeyboardButton("📰 News & Events", callback_data="cat_news")],
+                [InlineKeyboardButton("📰 News (Breaking Alerts)", callback_data="cat_news")],
                 [InlineKeyboardButton("« Back", callback_data="start")]
             ]
             
             await query.edit_message_text(
                 "📂 Select a category to view trending content:\n\n"
-                "🎯 Each category contains only relevant content - no mixing!",
+                "🎯 Each category contains only relevant content - no mixing!\n\n"
+                "⚽ Sports: Get LIVE goal alerts & match updates!\n"
+                "📰 News: Get BREAKING news alerts instantly!",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+        finally:
+            db.close()
+    
+    @check_ban
+    async def show_sports_leagues(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show sports league selection"""
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = [
+            [InlineKeyboardButton("🏴 Premier League (England)", callback_data="league_premier_league")],
+            [InlineKeyboardButton("🇪🇸 La Liga (Spain)", callback_data="league_la_liga")],
+            [InlineKeyboardButton("🇩🇪 Bundesliga (Germany)", callback_data="league_bundesliga")],
+            [InlineKeyboardButton("🇮🇹 Serie A (Italy)", callback_data="league_serie_a")],
+            [InlineKeyboardButton("🇫🇷 Ligue 1 (France)", callback_data="league_ligue_1")],
+            [InlineKeyboardButton("🏆 Champions League", callback_data="league_champions_league")],
+            [InlineKeyboardButton("🏆 Europa League", callback_data="league_europa_league")],
+            [InlineKeyboardButton("🏀 NBA (Basketball)", callback_data="league_nba")],
+            [InlineKeyboardButton("🏈 NFL (American Football)", callback_data="league_nfl")],
+            [InlineKeyboardButton("🎯 All Sports", callback_data="cat_sports")],
+            [InlineKeyboardButton("« Back", callback_data="categories")]
+        ]
+        
+        await query.edit_message_text(
+            "⚽ Select Your Favorite League:\n\n"
+            "🔥 Get trending content from your league\n"
+            "⚡ LIVE goal alerts (Pro members)\n"
+            "🏆 Best goals, highlights & moments\n\n"
+            "💡 Pro Tip: Subscribe to get instant notifications when your team scores!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    @check_ban
+    async def show_league_content(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show content for specific league"""
+        query = update.callback_query
+        await query.answer()
+        
+        league = query.data.replace('league_', '')
+        
+        user = query.from_user
+        db = SessionLocal()
+        try:
+            db_user = db.query(User).filter(User.telegram_id == user.id).first()
+            
+            if not self.check_rate_limit(db_user):
+                db.commit()
+                await query.answer(
+                    "⚠️ Daily limit reached!\n\nFree: 10/day | Pro: Unlimited\n\nUpgrade: /subscribe",
+                    show_alert=True
+                )
+                return
+            
+            db.commit()
+            
+            # Enable live updates for Pro users
+            if db_user.is_premium and self.sports_updater:
+                current_leagues = self.sports_updater.get_user_leagues(user.id)
+                if league not in current_leagues:
+                    current_leagues.append(league)
+                    self.sports_updater.set_user_leagues(user.id, current_leagues)
+                    await query.answer("✅ Live updates enabled for this league!", show_alert=True)
+            
+            # Get league-specific content
+            limit = 20 if db_user.is_premium else 30
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            
+            league_names = {
+                'premier_league': 'premier league',
+                'la_liga': 'la liga',
+                'bundesliga': 'bundesliga',
+                'serie_a': 'serie a',
+                'ligue_1': 'ligue 1',
+                'champions_league': 'champions league',
+                'europa_league': 'europa league',
+                'nba': 'nba',
+                'nfl': 'nfl'
+            }
+            
+            league_keyword = league_names.get(league, league)
+            
+            from sqlalchemy import or_
+            db_contents = db.query(Content).filter(
+                Content.category == 'sports',
+                Content.created_at >= cutoff,
+                Content.thumbnail.isnot(None),
+                or_(
+                    Content.title.ilike(f'%{league_keyword}%'),
+                    Content.description.ilike(f'%{league_keyword}%')
+                )
+            ).order_by(Content.trend_score.desc()).limit(limit * 2).all()
+            
+            contents = []
+            seen_urls = set()
+            
+            for c in db_contents:
+                if c.url in seen_urls:
+                    continue
+                
+                text = f"{c.title} {c.description or ''}".lower()
+                quality_boost = 0
+                for quality_type, keywords in self.sports_quality_keywords.items():
+                    if any(kw in text for kw in keywords):
+                        quality_boost += 20
+                        break
+                
+                contents.append({
+                    'id': c.id, 'title': c.title, 'url': c.url,
+                    'platform': c.platform, 'category': c.category,
+                    'thumbnail': c.thumbnail, 'description': c.description,
+                    'engagement_score': c.engagement_score,
+                    'trend_score': c.trend_score + quality_boost,
+                    'created_at': c.created_at
+                })
+                seen_urls.add(c.url)
+            
+            contents.sort(key=lambda x: x['trend_score'], reverse=True)
+            contents = contents[:limit]
+            
+            if not contents:
+                await query.edit_message_text(
+                    f"⚽ No recent content for {league_keyword.title()}\n\n"
+                    "Try another league or check back soon!",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="sports_leagues")]])
+                )
+                return
+            
+            context.user_data['category'] = f'sports_{league}'
+            context.user_data['contents'] = contents
+            context.user_data['index'] = 0
+            
+            await self.send_content(query, contents[0], 0, len(contents), db_user.is_premium)
+            
         finally:
             db.close()
     
@@ -586,7 +826,7 @@ class TrendLensBot:
                 return
             
             db.commit()
-            limit = 20 if db_user.is_premium else 5
+            limit = 20 if db_user.is_premium else 30
             
             # Calculate time cutoff based on filter
             if time_filter == 'today':
@@ -605,17 +845,18 @@ class TrendLensBot:
                 except:
                     pass
             
-            # Get from cache first with shorter timeout
-            cached = []
+            # For news, prioritize breaking news
+            if category == 'news':
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=6)  # Last 6 hours for breaking news
+            
+            # Try cache first - instant response
             cache_key = f"trending:{category}:{time_filter}"
+            contents = []
+            
             if self.redis:
                 try:
-                    # Set shorter timeout for cache operations
-                    cached = self.redis.zrevrange(cache_key, 0, limit-1)
-                    if cached and len(cached) >= limit:
-                        print(f"Cache hit for {category}:{time_filter}: {len(cached)} items")
-                        # Use cached data immediately
-                        contents = []
+                    cached = self.redis.zrevrange(cache_key, 0, limit-1, withscores=False)
+                    if cached and len(cached) >= 3:
                         for item_bytes in cached[:limit]:
                             try:
                                 item = json.loads(item_bytes.decode('utf-8'))
@@ -624,117 +865,68 @@ class TrendLensBot:
                             except:
                                 continue
                         
-                        if len(contents) >= limit:
-                            # Send immediately from cache
+                        if len(contents) >= 3:
+                            # Instant response from cache
                             context.user_data['category'] = category
-                            context.user_data['contents'] = contents[:limit]
+                            context.user_data['contents'] = contents
                             context.user_data['index'] = 0
                             context.user_data['time_filter'] = time_filter
-                            
-                            await self.send_content_with_filters(query, contents[0], 0, len(contents[:limit]), db_user.is_premium, category, time_filter)
+                            await self.send_content_with_filters(query, contents[0], 0, len(contents), db_user.is_premium, category, time_filter)
                             return
-                except Exception as e:
-                    print(f"Cache error: {e}")
-                    cached = []
+                except:
+                    pass
             
-            if cached:
-                # Use cached content and filter by time
-                contents = []
-                for item_bytes in cached:
-                    try:
-                        item = json.loads(item_bytes.decode('utf-8'))
-                        # Validate category matches
-                        if item.get('category') == category:
-                            # Skip cached content for time filters - force database query
-                            if time_filter != '48h':
-                                continue
-                            contents.append(item)
-                    except:
-                        continue
-                
-                # If time filter is not default, skip cache and use database
-                if time_filter != '48h':
-                    contents = []
-                
-                if contents:
-                    contents = self.deduplicate_content(contents)
-                    contents = self.filter_quality_content(contents, min_quality=30)
-                    contents = self.sort_by_trending(contents)
-                    
-                    if len(contents) >= limit:
-                        contents = contents[:limit]
+            # Fast database query - minimal processing
+            db_contents = db.query(Content).filter(
+                Content.category == category,
+                Content.created_at >= cutoff,
+                Content.thumbnail.isnot(None)
+            ).order_by(Content.trend_score.desc()).limit(limit * 2).all()  # Get more for quality filtering
             
-            if not cached or not contents:
-                # Optimized query - use only indexed columns
-                if category == 'memes':
-                    db_contents = db.query(Content).filter(
-                        Content.category == 'memes',
-                        Content.created_at >= cutoff
-                    ).order_by(Content.trend_score.desc()).limit(limit).all()
-                elif category == 'sports':
-                    db_contents = db.query(Content).filter(
-                        Content.category == 'sports',
-                        Content.created_at >= cutoff
-                    ).order_by(Content.trend_score.desc()).limit(limit).all()
-                elif category == 'entertainment':
-                    db_contents = db.query(Content).filter(
-                        Content.category == 'entertainment',
-                        Content.created_at >= cutoff
-                    ).order_by(Content.trend_score.desc()).limit(limit).all()
-                elif category == 'gaming':
-                    db_contents = db.query(Content).filter(
-                        Content.category == 'gaming',
-                        Content.created_at >= cutoff
-                    ).order_by(Content.trend_score.desc()).limit(limit).all()
-                elif category == 'jobs':
-                    db_contents = db.query(Content).filter(
-                        Content.category == 'jobs',
-                        Content.created_at >= cutoff
-                    ).order_by(Content.trend_score.desc()).limit(limit).all()
-                elif category == 'news':
-                    db_contents = db.query(Content).filter(
-                        Content.category == 'news',
-                        Content.created_at >= cutoff
-                    ).order_by(Content.trend_score.desc()).limit(limit).all()
-                elif category == 'tech':
-                    db_contents = db.query(Content).filter(
-                        Content.category == 'tech',
-                        Content.created_at >= cutoff
-                    ).order_by(Content.trend_score.desc()).limit(limit).all()
-                else:
-                    db_contents = []
+            # Smart filtering - prioritize BEST content for ALL categories
+            seen_urls = set()
+            for c in db_contents:
+                if c.url in seen_urls:
+                    continue
                 
-                # Convert to dict format and cache
-                contents = []
-                for c in db_contents:
-                    content_dict = {
-                        'id': c.id,
-                        'title': c.title,
-                        'url': c.url,
-                        'platform': c.platform,
-                        'category': c.category,
-                        'thumbnail': c.thumbnail,
-                        'description': c.description,
-                        'engagement_score': c.engagement_score,
-                        'trend_score': c.trend_score
-                    }
-                    contents.append(content_dict)
+                # Universal quality boost for ALL categories
+                quality_boost = 0
+                text = f"{c.title} {c.description or ''}".lower()
                 
-                contents = self.deduplicate_content(contents)
-                contents = self.filter_quality_content(contents, min_quality=30)
-                contents = self.sort_by_trending(contents)
+                # Check category-specific quality keywords
+                if category in self.quality_keywords:
+                    keywords = self.quality_keywords[category]
+                    if any(kw in text for kw in keywords):
+                        quality_boost += 20  # Boost for quality content
                 
-                # Cache to Redis with time filter key
-                if self.redis and contents:
-                    try:
-                        for content_dict in contents[:limit]:
-                            self.redis.zadd(
-                                cache_key,
-                                {json.dumps(content_dict): content_dict.get('trend_score', 0)}
-                            )
-                        self.redis.expire(cache_key, 120)  # 2 min cache for real-time
-                    except:
-                        pass
+                # Additional boost for sports (use sports_quality_keywords)
+                if category == 'sports':
+                    for quality_type, keywords in self.sports_quality_keywords.items():
+                        if any(kw in text for kw in keywords):
+                            quality_boost += 20
+                            break
+                
+                contents.append({
+                    'id': c.id, 'title': c.title, 'url': c.url,
+                    'platform': c.platform, 'category': c.category,
+                    'thumbnail': c.thumbnail, 'description': c.description,
+                    'engagement_score': c.engagement_score,
+                    'trend_score': c.trend_score + quality_boost, 'created_at': c.created_at
+                })
+                seen_urls.add(c.url)
+            
+            # Sort by boosted trend score for ALL categories
+            contents.sort(key=lambda x: x['trend_score'], reverse=True)
+            contents = contents[:limit]  # Take top after sorting
+            
+            # Cache for next time
+            if self.redis and contents:
+                try:
+                    for content_dict in contents:
+                        self.redis.zadd(cache_key, {json.dumps(content_dict): content_dict.get('trend_score', 0)})
+                    self.redis.expire(cache_key, 300)
+                except:
+                    pass
             
 
             # Track analytics
@@ -768,21 +960,33 @@ class TrendLensBot:
             url = content['url']
             platform = content['platform']
             description = content.get('description', '')
+            thumbnail = content.get('thumbnail')
         else:
             title = content.title
             url = content.url
             platform = content.platform
             description = content.description or ''
+            thumbnail = content.thumbnail
+        
+        # Fix and validate thumbnail
+        if thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.fix_thumbnail_url(thumbnail)
+            except:
+                thumbnail = None
+        
+        # Get fallback thumbnail if needed
+        if not thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.get_thumbnail(url, platform, content if isinstance(content, dict) else None)
+            except:
+                thumbnail = None
         
         # Time filter label
         filter_labels = {'today': '🔥 Today', 'week': '📅 This Week', '24h': '⏰ 24 Hours', '48h': '🕒 48 Hours'}
         filter_label = filter_labels.get(time_filter, '🕒 48 Hours')
         
-        text = f"{filter_label}\n\n🔥 {title}\n\n📱 Platform: {platform.upper()}\n"
-        if is_premium and description:
-            text += f"📝 {description[:150]}...\n\n"
-        text += f"🔗 {url}\n\n📊 Item {index+1}/{total}"
-        
+        # Build keyboard
         keyboard = []
         
         # Time filter buttons (Pro only)
@@ -812,23 +1016,55 @@ class TrendLensBot:
         ])
         keyboard.append([InlineKeyboardButton("« Categories", callback_data="categories")])
         
+        # Check if this is a video
+        is_video = self.video_handler.is_video_url(url)
+        should_send_video, video_url = self.video_handler.should_send_as_video(url, platform)
+        
+        # Build caption/text
+        caption = f"{filter_label}\n\n🔥 {title}\n\n📱 Platform: {platform.upper()}\n"
+        if is_premium and description:
+            caption += f"📝 {description[:150]}...\n\n"
+        caption += f"🔗 {url}\n\n📊 Item {index+1}/{total}"
+        
         try:
-            new_markup = InlineKeyboardMarkup(keyboard)
-            _current_text = getattr(query.message, 'text', None)
-            _current_markup = getattr(query.message, 'reply_markup', None)
-            if _current_text == text and _current_markup == new_markup:
-                await query.answer("Already showing this content.", show_alert=False)
-            else:
-                await query.edit_message_text(text, reply_markup=new_markup)
-        except Exception as e:
-            if "message is not modified" in str(e).lower():
-                await query.answer("Already showing this content.", show_alert=False)
-            else:
+            # Delete old message and send new one with media
+            await query.message.delete()
+            
+            # Send video if available
+            if should_send_video and video_url:
                 try:
-                    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-                except Exception as inner_e:
-                    if "message is not modified" not in str(inner_e).lower():
-                        raise
+                    await query.message.reply_video(
+                        video=video_url,
+                        caption=caption[:1024],
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        supports_streaming=True
+                    )
+                    return
+                except Exception as e:
+                    logging.error(f"Failed to send video: {e}")
+            
+            # Send photo with video thumbnail (for YouTube, etc.)
+            if is_video and thumbnail:
+                try:
+                    await query.message.reply_photo(
+                        photo=thumbnail,
+                        caption=caption[:1024],
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                    return
+                except Exception as e:
+                    logging.error(f"Failed to send photo: {e}")
+            
+            # Fallback to text message
+            await query.message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        except Exception as e:
+            # If delete fails, try editing
+            try:
+                await query.edit_message_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
+            except Exception as inner_e:
+                if "message is not modified" not in str(inner_e).lower():
+                    logging.error(f"Failed to send content: {inner_e}")
 
     async def send_content(self, query, content, index, total, is_premium):
         if isinstance(content, dict):
@@ -844,13 +1080,29 @@ class TrendLensBot:
             thumbnail = content.thumbnail
             description = content.description or ''
         
-        text = f"🔥 {title}\n\n"
-        text += f"📱 Platform: {platform.upper()}\n"
-        if is_premium and description:
-            text += f"📝 {description[:150]}...\n\n"
-        text += f"🔗 {url}\n\n"
-        text += f"📊 Item {index+1}/{total}"
+        # Fix and validate thumbnail
+        if thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.fix_thumbnail_url(thumbnail)
+            except:
+                thumbnail = None
         
+        # Get fallback thumbnail if needed
+        if not thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.get_thumbnail(url, platform, content if isinstance(content, dict) else None)
+            except:
+                thumbnail = None
+        
+        # Build caption
+        caption = f"🔥 {title}\n\n"
+        caption += f"📱 Platform: {platform.upper()}\n"
+        if is_premium and description:
+            caption += f"📝 {description[:150]}...\n\n"
+        caption += f"🔗 {url}\n\n"
+        caption += f"📊 Item {index+1}/{total}"
+        
+        # Build keyboard
         keyboard = []
         nav_row = []
         if index > 0:
@@ -866,11 +1118,46 @@ class TrendLensBot:
         ])
         keyboard.append([InlineKeyboardButton("« Categories", callback_data="categories")])
         
+        # Check if this is a video
+        is_video = self.video_handler.is_video_url(url)
+        should_send_video, video_url = self.video_handler.should_send_as_video(url, platform)
+        
         try:
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        except:
+            # Delete old message
+            await query.message.delete()
+            
+            # Send video if available
+            if should_send_video and video_url:
+                try:
+                    await query.message.reply_video(
+                        video=video_url,
+                        caption=caption[:1024],
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        supports_streaming=True
+                    )
+                    return
+                except Exception as e:
+                    logging.error(f"Failed to send video: {e}")
+            
+            # Send photo with thumbnail (for YouTube, etc.)
+            if is_video and thumbnail:
+                try:
+                    await query.message.reply_photo(
+                        photo=thumbnail,
+                        caption=caption[:1024],
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                    return
+                except Exception as e:
+                    logging.error(f"Failed to send photo: {e}")
+            
+            # Fallback to text
+            await query.message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        except Exception as e:
+            # Fallback to editing if delete fails
             try:
-                await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+                await query.edit_message_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
             except:
                 pass
     
@@ -1548,6 +1835,307 @@ class TrendLensBot:
         finally:
             db.close()
     
+    async def bulk_grant(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Grant pro to multiple users: /bulk_grant user_id1,user_id2,user_id3 days"""
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /bulk_grant <user_ids> <days>\n"
+                "Example: /bulk_grant 123,456,789 30\n"
+                "Separate user IDs with commas (no spaces)"
+            )
+            return
+        
+        try:
+            user_ids = [int(uid.strip()) for uid in context.args[0].split(',')]
+            days = int(context.args[1])
+        except:
+            await update.message.reply_text("❌ Invalid format. Use: /bulk_grant 123,456,789 30")
+            return
+        
+        await update.message.reply_text(f"⏳ Processing {len(user_ids)} users...")
+        
+        from bulk_operations import get_bulk_ops
+        bulk_ops = get_bulk_ops()
+        
+        try:
+            results = bulk_ops.bulk_grant_pro(user_ids, days)
+            
+            text = f"✅ Bulk Grant Complete\n\n"
+            text += f"✅ Success: {results['success']}\n"
+            text += f"❌ Failed: {results['failed']}\n"
+            
+            if results['errors']:
+                text += f"\nErrors:\n"
+                for error in results['errors'][:5]:  # Show first 5 errors
+                    text += f"• {error}\n"
+            
+            await update.message.reply_text(text)
+        finally:
+            bulk_ops.close()
+    
+    async def bulk_revoke(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Revoke pro from multiple users: /bulk_revoke user_id1,user_id2,user_id3"""
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /bulk_revoke <user_ids>\n"
+                "Example: /bulk_revoke 123,456,789\n"
+                "Separate user IDs with commas (no spaces)"
+            )
+            return
+        
+        try:
+            user_ids = [int(uid.strip()) for uid in context.args[0].split(',')]
+        except:
+            await update.message.reply_text("❌ Invalid format. Use: /bulk_revoke 123,456,789")
+            return
+        
+        await update.message.reply_text(f"⏳ Processing {len(user_ids)} users...")
+        
+        from bulk_operations import get_bulk_ops
+        bulk_ops = get_bulk_ops()
+        
+        try:
+            results = bulk_ops.bulk_revoke_pro(user_ids)
+            
+            text = f"✅ Bulk Revoke Complete\n\n"
+            text += f"✅ Success: {results['success']}\n"
+            text += f"❌ Failed: {results['failed']}\n"
+            
+            if results['errors']:
+                text += f"\nErrors:\n"
+                for error in results['errors'][:5]:
+                    text += f"• {error}\n"
+            
+            await update.message.reply_text(text)
+        finally:
+            bulk_ops.close()
+    
+    async def bulk_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Message multiple users: /bulk_message user_ids message"""
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /bulk_message <user_ids> <message>\n"
+                "Example: /bulk_message 123,456,789 Hello everyone!"
+            )
+            return
+        
+        try:
+            user_ids = [int(uid.strip()) for uid in context.args[0].split(',')]
+            message = ' '.join(context.args[1:])
+        except:
+            await update.message.reply_text("❌ Invalid format")
+            return
+        
+        await update.message.reply_text(f"📤 Sending to {len(user_ids)} users...")
+        
+        from bulk_operations import get_bulk_ops
+        bulk_ops = get_bulk_ops(self.application)
+        
+        try:
+            results = await bulk_ops.bulk_message_users(user_ids, message)
+            
+            text = f"✅ Bulk Message Complete\n\n"
+            text += f"✅ Sent: {results['success']}\n"
+            text += f"❌ Failed: {results['failed']}\n"
+            
+            await update.message.reply_text(text)
+        finally:
+            bulk_ops.close()
+    
+    async def message_inactive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Message inactive users: /message_inactive days"""
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        days = int(context.args[0]) if context.args else 30
+        
+        from bulk_operations import get_bulk_ops
+        bulk_ops = get_bulk_ops(self.application)
+        
+        try:
+            users = bulk_ops.get_inactive_users(days)
+            
+            if not users:
+                await update.message.reply_text(f"No inactive users found ({days} days)")
+                return
+            
+            await update.message.reply_text(
+                f"Found {len(users)} inactive users ({days}+ days)\n\n"
+                f"Send message? Reply with message text or /cancel"
+            )
+            
+            # Store context for next message
+            context.user_data['bulk_inactive_users'] = [u.telegram_id for u in users]
+        finally:
+            bulk_ops.close()
+    
+    async def export_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export users to CSV: /export_users"""
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        await update.message.reply_text("📊 Exporting users...")
+        
+        from bulk_operations import get_bulk_ops
+        bulk_ops = get_bulk_ops()
+        
+        try:
+            result = bulk_ops.export_users_csv()
+            
+            await update.message.reply_text(
+                f"✅ Export complete!\n\n"
+                f"📁 File: {result['file']}\n"
+                f"👥 Users: {result['exported']}"
+            )
+            
+            # Send file
+            with open(result['file'], 'rb') as f:
+                await update.message.reply_document(document=f, filename=result['file'])
+        finally:
+            bulk_ops.close()
+    
+    async def bulk_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show bulk operation statistics: /bulk_stats"""
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        from bulk_operations import get_bulk_ops
+        bulk_ops = get_bulk_ops()
+        
+        try:
+            stats = bulk_ops.get_bulk_statistics()
+            
+            text = f"📊 Bulk Operations Statistics\n\n"
+            text += f"👥 Total Users: {stats['total_users']}\n"
+            text += f"✨ Pro Users: {stats['pro_users']}\n"
+            text += f"🆓 Free Users: {stats['free_users']}\n"
+            text += f"🔥 Active (7d): {stats['active_users_7d']}\n"
+            text += f"⚠️ Expiring Soon: {stats['expiring_soon']}\n"
+            text += f"💤 Inactive (30d): {stats['inactive_30d']}\n"
+            text += f"📈 Conversion: {stats['conversion_rate']}\n\n"
+            text += f"Commands:\n"
+            text += f"/bulk_grant - Grant pro to multiple users\n"
+            text += f"/bulk_revoke - Revoke pro from users\n"
+            text += f"/bulk_message - Message multiple users\n"
+            text += f"/message_inactive - Message inactive users\n"
+            text += f"/export_users - Export users to CSV"
+            
+            await update.message.reply_text(text)
+        finally:
+            bulk_ops.close()
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        db = SessionLocal()
+        try:
+            from collections import Counter
+            days = int(context.args[0]) if context.args else 7
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            
+            total_users = db.query(User).count()
+            new_users = db.query(User).filter(User.created_at >= cutoff).count()
+            pro_users = db.query(User).filter(User.is_premium == True).count()
+            active_users = db.query(Analytics).filter(Analytics.timestamp >= cutoff).distinct(Analytics.user_id).count()
+            
+            events = db.query(Analytics).filter(Analytics.timestamp >= cutoff).all()
+            event_counts = Counter([e.event_type for e in events])
+            category_views = Counter([e.category for e in events if e.category])
+            
+            total_content = db.query(Content).count()
+            new_content = db.query(Content).filter(Content.created_at >= cutoff).count()
+            
+            pending_payments = db.query(Payment).filter(Payment.status == 'submitted').count()
+            approved_payments = db.query(Payment).filter(Payment.status == 'approved', Payment.approved_at >= cutoff).count()
+            revenue = approved_payments * 5
+            
+            retention = (active_users / total_users * 100) if total_users > 0 else 0
+            conversion = (pro_users / total_users * 100) if total_users > 0 else 0
+            
+            text = f"📊 Advanced Analytics ({days}d)\n\n"
+            text += f"👥 Users:\n"
+            text += f"  Total: {total_users}\n"
+            text += f"  New: {new_users}\n"
+            text += f"  Active: {active_users} ({retention:.1f}%)\n"
+            text += f"  Pro: {pro_users} ({conversion:.1f}%)\n\n"
+            
+            text += f"📄 Content:\n"
+            text += f"  Total: {total_content}\n"
+            text += f"  New: {new_content}\n\n"
+            
+            text += f"💰 Revenue:\n"
+            text += f"  Approved: {approved_payments}\n"
+            text += f"  Pending: {pending_payments}\n"
+            text += f"  Total: ${revenue}\n\n"
+            
+            text += f"📊 Events:\n"
+            for event, count in event_counts.most_common(5):
+                text += f"  {event}: {count}\n"
+            
+            text += f"\n📂 Top Categories:\n"
+            for cat, count in category_views.most_common(5):
+                text += f"  {cat}: {count}\n"
+            
+            await update.message.reply_text(text)
+        finally:
+            db.close()
+    
+    async def unban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.admin_id:
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /unban <user_id>\n"
+                "Example: /unban 123456789"
+            )
+            return
+        
+        try:
+            user_id = int(context.args[0])
+        except:
+            await update.message.reply_text("❌ Invalid user ID")
+            return
+        
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.telegram_id == user_id).first()
+            
+            if not user:
+                await update.message.reply_text("❌ User not found")
+                return
+            
+            if hasattr(user, 'is_banned'):
+                user.is_banned = False
+            else:
+                await update.message.reply_text("⚠️ Unban feature not available. Run database migration first.")
+                return
+            db.commit()
+            
+            await update.message.reply_text(
+                f"✅ User unbanned\n\n"
+                f"👤 @{user.username}\n"
+                f"🆔 ID: {user_id}"
+            )
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ You have been unbanned. You can now use the bot again."
+                )
+            except:
+                pass
+        finally:
+            db.close()
+    
     @check_ban
     async def saved(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -1621,10 +2209,10 @@ class TrendLensBot:
             db.close()
     
     async def send_saved_content(self, message, content, index, total):
-        text = f"💾 Saved Content\n\n🔥 {content['title']}\n\n📁 {content['category'].title()}\n📱 {content['platform'].upper()}\n"
+        caption = f"💾 Saved Content\n\n🔥 {content['title']}\n\n📁 {content['category'].title()}\n📱 {content['platform'].upper()}\n"
         if content.get('description'):
-            text += f"📝 {content['description'][:150]}...\n\n"
-        text += f"🔗 {content['url']}\n\n📊 {index+1}/{total}"
+            caption += f"📝 {content['description'][:150]}...\n\n"
+        caption += f"🔗 {content['url']}\n\n📊 {index+1}/{total}"
         
         keyboard = []
         nav_row = []
@@ -1638,7 +2226,50 @@ class TrendLensBot:
         keyboard.append([InlineKeyboardButton("🔗 Open", url=content['url'])])
         keyboard.append([InlineKeyboardButton("« Back", callback_data="start")])
         
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        # Check if video
+        url = content['url']
+        platform = content['platform']
+        thumbnail = content.get('thumbnail')
+        
+        # Fix and validate thumbnail
+        if thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.fix_thumbnail_url(thumbnail)
+            except:
+                thumbnail = None
+        
+        # Get fallback thumbnail if needed
+        if not thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.get_thumbnail(url, platform, content)
+            except:
+                thumbnail = None
+        
+        is_video = self.video_handler.is_video_url(url)
+        should_send_video, video_url = self.video_handler.should_send_as_video(url, platform)
+        
+        try:
+            # Send video if available
+            if should_send_video and video_url:
+                await message.reply_video(
+                    video=video_url,
+                    caption=caption[:1024],
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    supports_streaming=True
+                )
+            # Send photo with thumbnail
+            elif is_video and thumbnail:
+                await message.reply_photo(
+                    photo=thumbnail,
+                    caption=caption[:1024],
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            # Fallback to text
+            else:
+                await message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            logging.error(f"Failed to send saved content: {e}")
+            await message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
     
     @check_ban
     async def saved_navigate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1712,7 +2343,7 @@ class TrendLensBot:
                 return
             
             db.commit()
-            limit = 20 if db_user.is_premium else 5
+            limit = 20 if db_user.is_premium else 30
             
             from sqlalchemy import or_
             cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
@@ -1773,11 +2404,26 @@ class TrendLensBot:
         platform = content['platform']
         category = content['category']
         description = content.get('description', '')
+        thumbnail = content.get('thumbnail')
         
-        text = f"🔍 '{query}'\n\n🔥 {title}\n\n📁 {category.title()}\n📱 {platform.upper()}\n"
+        # Fix and validate thumbnail
+        if thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.fix_thumbnail_url(thumbnail)
+            except:
+                thumbnail = None
+        
+        # Get fallback thumbnail if needed
+        if not thumbnail:
+            try:
+                thumbnail = self.thumbnail_handler.get_thumbnail(url, platform, content)
+            except:
+                thumbnail = None
+        
+        caption = f"🔍 '{query}'\n\n🔥 {title}\n\n📁 {category.title()}\n📱 {platform.upper()}\n"
         if is_premium and description:
-            text += f"📝 {description[:150]}...\n\n"
-        text += f"🔗 {url}\n\n📊 {index+1}/{total}"
+            caption += f"📝 {description[:150]}...\n\n"
+        caption += f"🔗 {url}\n\n📊 {index+1}/{total}"
         
         keyboard = []
         nav_row = []
@@ -1791,7 +2437,32 @@ class TrendLensBot:
         keyboard.append([InlineKeyboardButton("🔗 Open", url=url)])
         keyboard.append([InlineKeyboardButton("« Categories", callback_data="categories")])
         
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        # Check if video
+        is_video = self.video_handler.is_video_url(url)
+        should_send_video, video_url = self.video_handler.should_send_as_video(url, platform)
+        
+        try:
+            # Send video if available
+            if should_send_video and video_url:
+                await message.reply_video(
+                    video=video_url,
+                    caption=caption[:1024],
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    supports_streaming=True
+                )
+            # Send photo with thumbnail
+            elif is_video and thumbnail:
+                await message.reply_photo(
+                    photo=thumbnail,
+                    caption=caption[:1024],
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            # Fallback to text
+            else:
+                await message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            logging.error(f"Failed to send search result: {e}")
+            await message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard))
     
     @check_ban
     async def search_navigate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1855,7 +2526,7 @@ class TrendLensBot:
         try:
             db_user = db.query(User).filter(User.telegram_id == user.id).first()
             
-            limit = 20 if db_user.is_premium else 5
+            limit = 20 if db_user.is_premium else 30
             cached = []
             if self.redis:
                 try:
@@ -1976,44 +2647,89 @@ class TrendLensBot:
                 return
             
             db.commit()
-            limit = 20 if db_user.is_premium else 5
+            limit = 20 if db_user.is_premium else 30
             
-            # Get tech content and filter by subcategory
+            # Get tech content and filter by subcategory with strict matching
             cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
-            from sqlalchemy import or_
+            
+            # Get all tech content from last 48 hours
             db_contents = db.query(Content).filter(
                 Content.category == 'tech',
-                Content.created_at >= cutoff,
-                or_(Content.url.like('%/r/technology/%'), Content.url.like('%/r/programming/%'), Content.url.like('%/r/gadgets/%'))
-            ).order_by(Content.trend_score.desc()).limit(50).all()
+                Content.created_at >= cutoff
+            ).order_by(Content.trend_score.desc()).limit(100).all()
             
-            # Filter by subcategory keywords
+            # Filter by subcategory keywords with strict matching
             filtered_contents = []
             keywords = self.tech_keywords.get(subcategory, [])
+            seen_urls = set()
+            seen_titles = set()
             
             for c in db_contents:
+                # Skip if no thumbnail
+                if not c.thumbnail or c.thumbnail == '':
+                    continue
+                
+                # Skip duplicates by URL
+                if c.url in seen_urls:
+                    continue
+                
+                # Check if content matches subcategory keywords
                 text = f"{c.title} {c.description or ''}".lower()
-                if any(keyword in text for keyword in keywords):
-                    filtered_contents.append({
-                        'id': c.id,
-                        'title': c.title,
-                        'url': c.url,
-                        'platform': c.platform,
-                        'category': c.category,
-                        'subcategory': subcategory,
-                        'thumbnail': c.thumbnail,
-                        'description': c.description,
-                        'engagement_score': c.engagement_score,
-                        'trend_score': c.trend_score
-                    })
-                    if len(filtered_contents) >= limit * 2:  # Get more for deduplication
-                        break
+                
+                # Must contain at least one keyword from this subcategory
+                if not any(keyword in text for keyword in keywords):
+                    continue
+                
+                # Ensure it doesn't contain keywords from OTHER subcategories (prevent mixing)
+                is_mixed = False
+                for other_subcat, other_keywords in self.tech_keywords.items():
+                    if other_subcat != subcategory:
+                        # If it has strong keywords from another subcategory, skip it
+                        strong_matches = sum(1 for kw in other_keywords if kw in text)
+                        if strong_matches >= 2:  # Has 2+ keywords from another subcategory
+                            is_mixed = True
+                            break
+                
+                if is_mixed:
+                    continue
+                
+                # Check for title duplicates
+                title_lower = c.title.lower().strip()
+                if title_lower in seen_titles:
+                    continue
+                
+                # Add to filtered list
+                content_dict = {
+                    'id': c.id,
+                    'title': c.title,
+                    'url': c.url,
+                    'platform': c.platform,
+                    'category': c.category,
+                    'subcategory': subcategory,
+                    'thumbnail': c.thumbnail,
+                    'description': c.description,
+                    'engagement_score': c.engagement_score,
+                    'trend_score': c.trend_score,
+                    'created_at': c.created_at
+                }
+                
+                filtered_contents.append(content_dict)
+                seen_urls.add(c.url)
+                seen_titles.add(title_lower)
+                
+                if len(filtered_contents) >= limit * 2:  # Get more for deduplication
+                    break
             
-            # Deduplicate tech content
+            # Apply advanced deduplication (cross-platform)
             filtered_contents = self.deduplicate_content(filtered_contents)
             
             # Apply quality filtering
             filtered_contents = self.filter_quality_content(filtered_contents, min_quality=30)
+            
+            # Sort by trending score
+            filtered_contents = self.sort_by_trending(filtered_contents)
+            
+            # Limit to final count
             filtered_contents = filtered_contents[:limit]
             
             if not filtered_contents:
@@ -2378,6 +3094,17 @@ class TrendLensBot:
         logging.error(f"Update {update} caused error {error}")
         logging.error(traceback.format_exc())
         
+        # Capture error in monitoring system
+        try:
+            error_monitor.capture_exception(error, context={
+                'update': str(update)[:500] if update else 'None',
+                'user_id': update.effective_user.id if update and update.effective_user else None,
+                'chat_id': update.effective_chat.id if update and update.effective_chat else None,
+                'error_type': type(error).__name__
+            })
+        except:
+            pass
+        
         try:
             if update and update.effective_message:
                 error_msg = "⚠️ Something went wrong.\n\n"
@@ -2398,14 +3125,168 @@ class TrendLensBot:
         except Exception as e:
             logging.error(f"Error in error_handler: {e}")
     
+    @check_ban
+    async def inline_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline queries for search"""
+        query = update.inline_query.query
+        
+        if not query or len(query) < 2:
+            # Show help message
+            results = [
+                InlineQueryResultArticle(
+                    id='help',
+                    title='🔍 Search TrendLens',
+                    description='Type keywords to search trending content',
+                    input_message_content=InputTextMessageContent(
+                        message_text="💡 How to use inline search:\n\n"
+                                   "1. Type @your_bot_username followed by keywords\n"
+                                   "2. Example: @your_bot_username messi goal\n"
+                                   "3. Select a result to share\n\n"
+                                   "🔥 Search across all trending content!"
+                    )
+                )
+            ]
+            await update.inline_query.answer(results, cache_time=300)
+            return
+        
+        user = update.inline_query.from_user
+        db = SessionLocal()
+        try:
+            db_user = db.query(User).filter(User.telegram_id == user.id).first()
+            
+            if not db_user:
+                # Create user if doesn't exist
+                db_user = User(
+                    telegram_id=user.id,
+                    username=user.username[:50] if user.username else None,
+                    categories=json.dumps([])
+                )
+                db.add(db_user)
+                db.commit()
+                db.refresh(db_user)
+            
+            # Check if banned
+            if hasattr(db_user, 'is_banned') and db_user.is_banned:
+                results = [
+                    InlineQueryResultArticle(
+                        id='banned',
+                        title='⛔ Account Banned',
+                        description='You have been banned from using this bot',
+                        input_message_content=InputTextMessageContent(
+                            message_text="⛔ You have been banned from using this bot."
+                        )
+                    )
+                ]
+                await update.inline_query.answer(results, cache_time=60)
+                return
+            
+            # Search database
+            from sqlalchemy import or_
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+            limit = 20 if db_user.is_premium else 10
+            
+            search_results = db.query(Content).filter(
+                Content.created_at >= cutoff,
+                or_(
+                    Content.title.ilike(f'%{query}%'),
+                    Content.description.ilike(f'%{query}%')
+                )
+            ).order_by(Content.trend_score.desc()).limit(limit).all()
+            
+            if not search_results:
+                results = [
+                    InlineQueryResultArticle(
+                        id='no_results',
+                        title=f'🔍 No results for "{query}"',
+                        description='Try different keywords or browse categories',
+                        input_message_content=InputTextMessageContent(
+                            message_text=f"🔍 No results found for '{query}'\n\n"
+                                       "💡 Try:\n"
+                                       "• Different keywords\n"
+                                       "• Simpler terms\n"
+                                       "• Browse categories: /start"
+                        )
+                    )
+                ]
+                await update.inline_query.answer(results, cache_time=60)
+                return
+            
+            # Build results
+            results = []
+            for idx, content in enumerate(search_results[:limit]):
+                # Build message text
+                message_text = f"🔥 {content.title}\n\n"
+                message_text += f"📁 {content.category.title()}\n"
+                message_text += f"📱 {content.platform.upper()}\n"
+                if db_user.is_premium and content.description:
+                    message_text += f"\n📝 {content.description[:200]}...\n"
+                message_text += f"\n🔗 {content.url}"
+                
+                # Create result
+                result = InlineQueryResultArticle(
+                    id=str(content.id),
+                    title=content.title[:100],
+                    description=f"{content.category.title()} • {content.platform.upper()}",
+                    thumbnail_url=content.thumbnail if content.thumbnail else None,
+                    input_message_content=InputTextMessageContent(
+                        message_text=message_text
+                    )
+                )
+                results.append(result)
+            
+            # Track analytics
+            self.track_analytics(db, db_user.id, 'inline_search', metadata={'query': query, 'results': len(results)})
+            
+            await update.inline_query.answer(results, cache_time=60)
+            
+        except Exception as e:
+            logging.error(f"Inline search error: {e}")
+            results = [
+                InlineQueryResultArticle(
+                    id='error',
+                    title='❌ Search Error',
+                    description='Something went wrong. Try again.',
+                    input_message_content=InputTextMessageContent(
+                        message_text="❌ Search failed. Please try again or use /search command."
+                    )
+                )
+            ]
+            await update.inline_query.answer(results, cache_time=10)
+        finally:
+            db.close()
+    
     async def post_init(self, application: Application) -> None:
         """Called by PTB after the application is initialized.
 
         Stores the application reference so the SIGTERM handler can reach it,
         and registers a SIGTERM handler that triggers a graceful shutdown.
         """
+        import sys
         self.application = application
         logging.info("Bot initialized — registering SIGTERM handler for graceful shutdown")
+        
+        # Initialize sports real-time updater
+        try:
+            self.sports_updater = init_sports_updater(application)
+            # Start background task for real-time updates
+            asyncio.create_task(self.sports_updater.start_realtime_updates())
+            logging.info("Sports real-time updater started")
+        except Exception as e:
+            logging.error(f"Failed to start sports updater: {e}")
+        
+        # Initialize news real-time updater
+        try:
+            self.news_updater = init_news_updater(application)
+            # Start background task for breaking news
+            asyncio.create_task(self.news_updater.start_realtime_news_updates())
+            logging.info("News real-time updater started")
+        except Exception as e:
+            logging.error(f"Failed to start news updater: {e}")
+
+        # Skip signal handlers on Windows
+        if sys.platform == 'win32':
+            logging.info("Windows detected - skipping signal handlers")
+            return
 
         loop = asyncio.get_event_loop()
 
@@ -2413,7 +3294,10 @@ class TrendLensBot:
             logging.info("SIGTERM received — initiating graceful shutdown")
             asyncio.ensure_future(self._graceful_shutdown(), loop=loop)
 
-        loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+        except NotImplementedError:
+            logging.warning("Signal handlers not supported on this platform")
 
     async def _graceful_shutdown(self) -> None:
         """Perform an ordered, graceful shutdown of all bot resources.
@@ -2492,7 +3376,7 @@ class TrendLensBot:
 
         logging.info("Post-shutdown cleanup complete")
 
-    def run(self):
+    def run(self, use_webhook=False):
         import sys
 
 
@@ -2533,12 +3417,27 @@ class TrendLensBot:
         app.add_handler(CommandHandler("users", self.list_users))
         app.add_handler(CommandHandler("broadcast", self.broadcast))
         app.add_handler(CommandHandler("grant", self.grant_pro))
+        app.add_handler(CommandHandler("ban", self.ban_user))
+        app.add_handler(CommandHandler("unban", self.unban_user))
         app.add_handler(CommandHandler("analytics", self.analytics_report))
         app.add_handler(CommandHandler("moderate", self.moderation_queue))
         app.add_handler(CommandHandler("approve_content", self.approve_content))
         app.add_handler(CommandHandler("reject_content", self.reject_content))
+        
+        # Bulk operations
+        app.add_handler(CommandHandler("bulk_grant", self.bulk_grant))
+        app.add_handler(CommandHandler("bulk_revoke", self.bulk_revoke))
+        app.add_handler(CommandHandler("bulk_message", self.bulk_message))
+        app.add_handler(CommandHandler("message_inactive", self.message_inactive))
+        app.add_handler(CommandHandler("export_users", self.export_users))
+        app.add_handler(CommandHandler("bulk_stats", self.bulk_stats))
+        
+        # Add inline query handler for inline search
+        app.add_handler(InlineQueryHandler(self.inline_search))
 
         app.add_handler(CallbackQueryHandler(self.show_categories, pattern="^categories$"))
+        app.add_handler(CallbackQueryHandler(self.show_sports_leagues, pattern="^sports_leagues$"))
+        app.add_handler(CallbackQueryHandler(self.show_league_content, pattern="^league_"))
         app.add_handler(CallbackQueryHandler(self.show_tech_subcategories, pattern="^cat_tech$"))
         app.add_handler(CallbackQueryHandler(self.show_tech_category, pattern="^techcat_"))
         app.add_handler(CallbackQueryHandler(self.show_category, pattern="^cat_[a-z]+(_[a-z0-9]+)?$"))
@@ -2562,20 +3461,34 @@ class TrendLensBot:
         except UnicodeEncodeError:
             print("TrendLens AI Bot started!")
             print(f"Admin ID: {self.admin_id}")
-        app.run_polling(
-            # Drop updates that accumulated while the bot was offline so the
-            # new instance doesn't replay stale messages.
-            drop_pending_updates=True,
-            # Let PTB handle SIGINT/SIGTERM; our post_init handler adds a
-            # SIGTERM listener that runs _graceful_shutdown before PTB's own
-            # cleanup, ensuring the polling session is fully closed first.
-            stop_signals=(signal.SIGINT, signal.SIGTERM),
-        )
+        
+        # Check for webhook mode
+        webhook_url = os.getenv('WEBHOOK_URL')
+        port = int(os.getenv('PORT', 8443))
+        
+        if use_webhook and webhook_url:
+            print(f"🌐 Running in WEBHOOK mode on port {port}")
+            print(f"📡 Webhook URL: {webhook_url}")
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=self.token,
+                webhook_url=f"{webhook_url}/{self.token}",
+                drop_pending_updates=True
+            )
+        else:
+            print("🔄 Running in POLLING mode (slower)")
+            app.run_polling(
+                drop_pending_updates=True,
+                stop_signals=None if sys.platform == 'win32' else (signal.SIGINT, signal.SIGTERM),
+            )
 
 
 if __name__ == '__main__':
     bot = TrendLensBot()
-    bot.run()
+    # Enable webhook mode by setting WEBHOOK_URL in .env
+    use_webhook = os.getenv('WEBHOOK_URL') is not None
+    bot.run(use_webhook=use_webhook)
 
     async def language_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query

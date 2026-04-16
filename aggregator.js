@@ -76,17 +76,45 @@ class ContentAggregator {
                 const engagement = data.score + data.num_comments;
                 const trendScore = this.calculateTrendScore(data.score, data.num_comments, data.created_utc);
                 
-                // Get better thumbnail
+                // Get the best quality thumbnail/image
                 let thumbnail = null;
+                
+                // Priority 1: High-res preview image (best quality)
                 if (data.preview && data.preview.images && data.preview.images[0]) {
-                    // Use high-res preview image
-                    thumbnail = data.preview.images[0].source.url.replace(/&amp;/g, '&');
-                } else if (data.thumbnail && data.thumbnail.startsWith('http')) {
-                    // Use thumbnail if available
+                    const previewImage = data.preview.images[0];
+                    // Get the highest resolution available
+                    if (previewImage.resolutions && previewImage.resolutions.length > 0) {
+                        // Get the largest resolution
+                        const largestRes = previewImage.resolutions[previewImage.resolutions.length - 1];
+                        thumbnail = largestRes.url.replace(/&amp;/g, '&');
+                    } else if (previewImage.source) {
+                        // Use source if no resolutions
+                        thumbnail = previewImage.source.url.replace(/&amp;/g, '&');
+                    }
+                }
+                
+                // Priority 2: Direct image URL (for image posts)
+                if (!thumbnail && data.url) {
+                    const url = data.url.toLowerCase();
+                    if (url.match(/\.(jpg|jpeg|png|gif|webp)$/i) || url.includes('i.redd.it') || url.includes('i.imgur.com')) {
+                        thumbnail = data.url;
+                    }
+                }
+                
+                // Priority 3: Reddit gallery (first image)
+                if (!thumbnail && data.is_gallery && data.media_metadata) {
+                    const firstMediaId = Object.keys(data.media_metadata)[0];
+                    if (firstMediaId) {
+                        const media = data.media_metadata[firstMediaId];
+                        if (media.s && media.s.u) {
+                            thumbnail = media.s.u.replace(/&amp;/g, '&');
+                        }
+                    }
+                }
+                
+                // Priority 4: Standard thumbnail (fallback)
+                if (!thumbnail && data.thumbnail && data.thumbnail.startsWith('http') && !data.thumbnail.includes('self') && !data.thumbnail.includes('default')) {
                     thumbnail = data.thumbnail;
-                } else if (data.url && (data.url.endsWith('.jpg') || data.url.endsWith('.png') || data.url.endsWith('.gif'))) {
-                    // Direct image link
-                    thumbnail = data.url;
                 }
                 
                 await this.storeContent({
